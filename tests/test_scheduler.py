@@ -117,6 +117,21 @@ def test_past_due_task_is_flagged():
     assert any(w.code == "deadline_passed" for w in r.warnings)
 
 
+def test_deadline_passed_only_when_due_at_is_not_after_real_now():
+    # Due at 10:10, now 10:07: scheduling would start at 10:15, but the deadline is NOT over yet.
+    soon = Task("a", "Soon", dt(2026, 1, 5, 10, 10), 60)
+    r = run([soon], dt(2026, 1, 5, 10, 7))
+    assert r.chunks == []
+    assert [(m.task_id, m.missing_min) for m in r.unschedulable] == [("a", 60)]
+    assert not any(w.code == "deadline_passed" for w in r.warnings)
+
+    # Due exactly now: the deadline is over.
+    exact = Task("b", "Exact", dt(2026, 1, 5, 10, 7), 60)
+    r = run([exact], dt(2026, 1, 5, 10, 7))
+    assert any(w.code == "deadline_passed" and w.task_id == "b" for w in r.warnings)
+    assert r.unschedulable[0].missing_min == 60
+
+
 def test_other_tasks_still_scheduled_when_one_is_impossible():
     bad = Task("bad", "Impossible", dt(2026, 1, 5, 9), 600)
     ok = Task("ok", "Fine", dt(2026, 1, 7, 12), 60)
@@ -207,15 +222,141 @@ def test_recurrence_until_is_honored():
     assert len(busy) == 3
 
 
-@pytest.mark.parametrize("bad", ["FREQ=MONTHLY", "FREQ=YEARLY", "DTSTART:20260101\nFREQ=DAILY", "nonsense", ""])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "FREQ=MONTHLY",
+        "FREQ=YEARLY",
+        "DTSTART:20260101\nFREQ=DAILY",
+        "nonsense",
+        "",
+        "FREQ=DAILY;FREQ=SECONDLY",  # repeated key (dateutil would use the last one)
+        "FREQ=DAILY;FREQ=DAILY",
+        "FREQ=SECONDLY",
+        "FREQ=DAILY;INTERVAL=0",  # would loop forever
+        "FREQ=DAILY;INTERVAL=53",
+        "FREQ=DAILY;INTERVAL=-1",
+        "FREQ=DAILY;BYHOUR=1,2,3",
+        "FREQ=DAILY;BYSETPOS=1",
+        "FREQ=DAILY;BYDAY=MO",  # BYDAY is weekly only
+        "FREQ=WEEKLY;BYDAY=1MO",
+        "FREQ=WEEKLY;BYDAY=MO,MO",
+        "FREQ=WEEKLY;BYDAY=XX",
+        "FREQ=DAILY;COUNT=0",
+        "FREQ=DAILY;COUNT=3661",
+        "FREQ=DAILY;COUNT=3;UNTIL=20260101",
+        "FREQ=DAILY;UNTIL=2026-01-01",
+        "FREQ=DAILY;UNTIL=20261340",
+        "FREQ=DAILY;WKST=XX",
+        "FREQ=DAILY;",
+        "FREQ",
+        "FREQ=DAILY;" + "COUNT=1;" * 100,
+    ],
+)
 def test_validate_rrule_rejects_unsupported(bad):
     with pytest.raises(ValueError):
         validate_rrule(bad)
 
 
-def test_validate_rrule_accepts_supported():
-    validate_rrule("FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20260501T000000Z")
-    validate_rrule("RRULE:FREQ=DAILY;COUNT=10")
+def test_validate_rrule_rejects_overlong_rule():
+    with pytest.raises(ValueError, match="longer than"):
+        validate_rrule("FREQ=DAILY;WKST=MO;" + "WKST=MO;" * 70)
+
+
+@pytest.mark.parametrize(
+    "good",
+    [
+        "FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20260501T000000Z",
+        "RRULE:FREQ=DAILY;COUNT=10",
+        "FREQ=DAILY",
+        "freq=daily;interval=2",
+        "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,TH;WKST=SU",
+        "FREQ=DAILY;UNTIL=20261215",
+        "FREQ=DAILY;UNTIL=20261215T235959",
+        "FREQ=DAILY;COUNT=3660",
+        "FREQ=DAILY;INTERVAL=52",
+    ],
+)
+def test_validate_rrule_accepts_supported(good):
+    validate_rrule(good)
+
+
+def test_recurring_sleep_block_keeps_wall_clock_end_across_dst():
+    # 23:00 to 07:00 every night in New York; the clocks change on Mar 8 and Nov 1, 2026.
+    start = dt(2026, 3, 6, 23, tz=NY)
+    block = BlockIn(start, dt(2026, 3, 7, 7, tz=NY), "FREQ=DAILY")
+    for lo, hi in ((dt(2026, 3, 5), dt(2026, 3, 12)), (dt(2026, 10, 28), dt(2026, 11, 5))):
+        # the second window starts months after the block does, which exercises fast-forwarding
+        busy = build_busy([block], [], tz=NY, global_padding_min=0, calendar_padding={}, lo=lo, hi=hi)
+        assert len(busy) >= 5
+        assert {b.start.astimezone(NY).strftime("%H:%M") for b in busy} == {"23:00"}
+        assert {b.end.astimezone(NY).strftime("%H:%M") for b in busy} == {"07:00"}
+
+
+def test_fast_forward_gives_same_occurrences_as_walking_from_the_start():
+    from dateutil.rrule import rrulestr
+
+    start = datetime(2001, 1, 1, 9, 30, tzinfo=UTC)  # a Monday, 25 years before the window
+    lo, hi = dt(2026, 10, 1), dt(2026, 10, 31)
+    for rule, extra in (
+        ("FREQ=DAILY", ""),
+        ("FREQ=DAILY;INTERVAL=3", ""),
+        ("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH", ""),
+        ("FREQ=WEEKLY;BYDAY=WE,FR;WKST=SU", ""),
+        ("FREQ=WEEKLY", ""),
+        ("FREQ=DAILY;UNTIL=20261015", ""),
+    ):
+        block = BlockIn(start, start + timedelta(hours=1), rule)
+        got = sorted(b.start for b in build_busy([block], [], tz=UTC, global_padding_min=0,
+                                                 calendar_padding={}, lo=lo, hi=hi))
+        text = rule.replace("UNTIL=20261015", "UNTIL=20261015T235959")
+        expected = [d.replace(tzinfo=UTC) for d in rrulestr(text, dtstart=start.replace(tzinfo=None))
+                    .between(datetime(2026, 9, 29), datetime(2026, 11, 2), inc=True)]
+        assert got == [e for e in expected if got and got[0] <= e <= got[-1]], rule
+        assert got, rule
+
+
+def test_count_is_counted_from_the_first_occurrence():
+    start = dt(2026, 1, 5, 9)
+    block = BlockIn(start, start + timedelta(hours=1), "FREQ=DAILY;COUNT=10")
+    busy = build_busy([block], [], tz=UTC, global_padding_min=0, calendar_padding={},
+                      lo=dt(2026, 1, 1), hi=dt(2026, 3, 1))
+    assert len(busy) == 10
+    late = build_busy([block], [], tz=UTC, global_padding_min=0, calendar_padding={},
+                      lo=dt(2026, 2, 1), hi=dt(2026, 3, 1))
+    assert late == []
+
+
+def test_crafted_rule_cannot_hang_or_flood(monkeypatch):
+    import time as _t
+    from app import busy as busy_mod
+
+    start = dt(2000, 1, 1, 9)
+    blocks = [BlockIn(start, start + timedelta(hours=1), "FREQ=DAILY") for _ in range(500)]
+    t0 = _t.monotonic()
+    out = build_busy(blocks, [], tz=UTC, global_padding_min=0, calendar_padding={},
+                     lo=dt(2026, 10, 8), hi=dt(2027, 11, 12))
+    assert _t.monotonic() - t0 < 5
+    assert len(out) == 500 * 400 or len(out) > 500 * 390
+
+    # The safety cap raises instead of silently dropping occurrences.
+    monkeypatch.setattr(busy_mod, "MAX_OCCURRENCES_PER_BLOCK", 5)
+    with pytest.raises(busy_mod.RecurrenceError) as err:
+        build_busy([BlockIn(start, start + timedelta(hours=1), "FREQ=DAILY", id="b1")], [], tz=UTC,
+                   global_padding_min=0, calendar_padding={}, lo=dt(2026, 10, 8), hi=dt(2026, 11, 8))
+    assert err.value.block_id == "b1"
+
+
+def test_build_busy_check_hook_can_abort():
+    start = dt(2026, 1, 5, 9)
+    block = BlockIn(start, start + timedelta(hours=1), "FREQ=DAILY")
+
+    def boom():
+        raise ScheduleTimeout()
+
+    with pytest.raises(ScheduleTimeout):
+        build_busy([block], [], tz=UTC, global_padding_min=0, calendar_padding={},
+                   lo=dt(2026, 1, 1), hi=dt(2026, 6, 1), check=boom)
 
 
 # ----------------------------------------------------------------- ordering and modes
@@ -246,6 +387,21 @@ def test_even_mode_spreads_across_days():
     assert len(per_day) == 4
     assert sum(per_day.values()) == 600
     assert max(per_day.values()) - min(per_day.values()) <= 60
+
+
+def test_even_mode_daily_target_is_rounded_up_to_a_multiple_of_min_chunk():
+    # 100 min over 3 days: share is 34 min, rounded up to a multiple of 30 gives 60 on the first day.
+    t = Task("a", "Work", dt(2026, 1, 7, 22), 100, splittable=True, min_chunk_min=30)
+    r = run([t], dt(2026, 1, 5, 8), options=opts("even"))
+    assert_valid(r, [t], options=opts("even"))
+    assert total_min(r.chunks) == 100
+    assert total_min([r.chunks[0]]) == 60
+    assert all(total_min([c]) >= 30 for c in r.chunks)
+
+    # With a 45-minute minimum chunk the first day gets 45, not 34 or 15-grid-rounded 45 by accident.
+    t2 = Task("b", "Work", dt(2026, 1, 7, 22), 100, splittable=True, min_chunk_min=50)
+    r2 = run([t2], dt(2026, 1, 5, 8), options=opts("even"))
+    assert total_min([r2.chunks[0]]) == 50  # share 34 -> next multiple of 50
 
 
 def test_even_mode_skips_days_without_room_and_still_finishes():

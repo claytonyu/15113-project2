@@ -1,8 +1,10 @@
 """Environment-driven configuration.
 
 Everything that differs between a local run and a deployed run comes from environment
-variables (loaded from `.env` locally). Only DATABASE_URL is needed to start; Google
+variables (loaded from `.env` locally). Only DATABASE_URL is needed to start locally; Google
 settings are optional and the Google endpoints report "not configured" without them.
+
+Mistakes fail at startup with a message naming the variable (never its value).
 """
 from __future__ import annotations
 
@@ -11,9 +13,14 @@ from dataclasses import dataclass
 from functools import lru_cache
 from urllib.parse import urlsplit
 
+from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+class ConfigError(RuntimeError):
+    """The environment is misconfigured. The message names the variable(s) involved."""
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -36,6 +43,7 @@ class Config:
     schedule_rate_limit: str
     auth_rate_limit: str
     schedule_timeout_s: float
+    trusted_proxy_hops: int
 
     @property
     def is_production(self) -> bool:
@@ -56,8 +64,47 @@ class Config:
         return self.backend_url.startswith("https://")
 
 
+def _validate_environment() -> None:
+    """Checks that need the raw environment (before defaults are applied)."""
+    problems: list[str] = []
+
+    if (_env("ENVIRONMENT", "local") or "local").lower() == "production":
+        for name in ("DATABASE_URL", "FRONTEND_ORIGIN"):
+            if not _env(name):
+                problems.append(f"{name} must be set when ENVIRONMENT=production")
+        if not (_env("BACKEND_URL") or _env("GOOGLE_REDIRECT_URI")):
+            problems.append("BACKEND_URL (or GOOGLE_REDIRECT_URI) must be set when ENVIRONMENT=production")
+
+    key = _env("TOKEN_ENCRYPTION_KEY")
+    if key:
+        try:
+            Fernet(key.encode())
+        except (ValueError, TypeError):
+            problems.append("TOKEN_ENCRYPTION_KEY is not a valid Fernet key")
+
+    has_id, has_secret = bool(_env("GOOGLE_CLIENT_ID")), bool(_env("GOOGLE_CLIENT_SECRET"))
+    if has_id != has_secret:
+        missing = "GOOGLE_CLIENT_SECRET" if has_id else "GOOGLE_CLIENT_ID"
+        problems.append(f"{missing} must be set together with the other Google client setting")
+    elif has_id and not key:
+        problems.append("TOKEN_ENCRYPTION_KEY must be set when Google login is configured")
+
+    for name, kind in (("SCHEDULE_TIMEOUT_S", float), ("TRUSTED_PROXY_HOPS", int)):
+        raw = _env(name)
+        if raw is not None:
+            try:
+                if kind(raw) < 0:
+                    raise ValueError
+            except ValueError:
+                problems.append(f"{name} must be a non-negative {'number' if kind is float else 'whole number'}")
+
+    if problems:
+        raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(problems))
+
+
 @lru_cache
 def get_config() -> Config:
+    _validate_environment()
     backend_url = (_env("BACKEND_URL", "http://localhost:8000") or "").rstrip("/")
     return Config(
         environment=(_env("ENVIRONMENT", "local") or "local").lower(),
@@ -71,4 +118,5 @@ def get_config() -> Config:
         schedule_rate_limit=_env("SCHEDULE_RATE_LIMIT", "30/minute") or "30/minute",
         auth_rate_limit=_env("AUTH_RATE_LIMIT", "20/minute") or "20/minute",
         schedule_timeout_s=float(_env("SCHEDULE_TIMEOUT_S", "10") or "10"),
+        trusted_proxy_hops=int(_env("TRUSTED_PROXY_HOPS", "1") or "1"),
     )

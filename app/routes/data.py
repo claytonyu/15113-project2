@@ -65,8 +65,8 @@ def get_state(sync_google: bool = True, user: dict = Depends(auth.require_user))
 @router.patch("/sync", response_model=SyncResponse, summary="Save a batch of changes (idempotent)")
 def sync(body: SyncRequest, user: dict = Depends(auth.require_user)):
     with connect() as conn:
-        repo.apply_sync(conn, user["id"], body)
-    return {"ok": True, "server_time": datetime.now(timezone.utc)}
+        skipped = repo.apply_sync(conn, user["id"], body)
+    return {"ok": True, "server_time": datetime.now(timezone.utc), "skipped": skipped}
 
 
 @router.delete("/account", status_code=204, summary="Delete the account and all its data")

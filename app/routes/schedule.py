@@ -1,14 +1,16 @@
 """Endpoint 6: generate a schedule."""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from .. import auth, repo, scheduler, services
-from ..busy import BlockIn, EventIn, build_busy
+from ..busy import BlockIn, EventIn, RecurrenceError, build_busy
 from ..config import get_config
 from ..db import connect
 from ..limiter import limiter
@@ -62,15 +64,12 @@ def generate_schedule(request: Request, body: ScheduleRequest, user: dict | None
             if access:
                 events, google_error = services.fetch_user_events(user["id"], access, selected, now, horizon_end, tz)
 
-    busy = build_busy(
-        [BlockIn(b.start, b.end, b.rrule) for b in body.blocks],
-        [EventIn(e["calendar_id"], e["start"], e["end"], e.get("dismissed", False)) for e in events],
-        tz=tz,
-        global_padding_min=settings.padding_min,
-        calendar_padding=calendar_padding,
-        lo=now,
-        hi=horizon_end,
-    )
+    # The compute limit covers recurrence expansion and placement (not the wait on Google above).
+    deadline_at = time.monotonic() + cfg.schedule_timeout_s
+
+    def check_time() -> None:
+        if time.monotonic() > deadline_at:
+            raise scheduler.ScheduleTimeout()
 
     options = scheduler.Options(
         tz=tz,
@@ -79,9 +78,22 @@ def generate_schedule(request: Request, body: ScheduleRequest, user: dict | None
         spread_mode=settings.spread_mode,
     )
     try:
-        result = scheduler.schedule(tasks, locked, busy, options, now, time_limit_s=cfg.schedule_timeout_s)
+        busy = build_busy(
+            [BlockIn(b.start, b.end, b.rrule, str(b.id)) for b in body.blocks],
+            [EventIn(e["calendar_id"], e["start"], e["end"], e.get("dismissed", False)) for e in events],
+            tz=tz,
+            global_padding_min=settings.padding_min,
+            calendar_padding=calendar_padding,
+            lo=now,
+            hi=horizon_end,
+            check=check_time,
+        )
+        result = scheduler.schedule(tasks, locked, busy, options, now, deadline_at=deadline_at)
     except scheduler.ScheduleTimeout:
         raise HTTPException(422, "This schedule is too large to compute in time. Try fewer tasks or blocks.")
+    except RecurrenceError as exc:
+        ids = [exc.block_id] if exc.block_id else []
+        return JSONResponse(status_code=422, content={"detail": str(exc), "ids": ids})
 
     return ScheduleResponse(
         chunks=[Chunk(id=UUID(c.id), task_id=UUID(c.task_id), start=c.start, end=c.end, locked=False) for c in result.chunks],

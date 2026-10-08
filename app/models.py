@@ -24,6 +24,8 @@ MAX_BLOCKS = 500
 MAX_LOCKED_CHUNKS = 2000
 MAX_CALENDARS = 100
 MAX_SYNC_ITEMS = 5000
+BLOCK_MIN_YEAR = 2000
+BLOCK_MAX_YEAR = 2100
 
 
 def _to_utc(value: datetime) -> datetime:
@@ -68,6 +70,12 @@ class Settings(Shape):
         if self.work_end <= self.work_start:
             raise ValueError("work_end must be later than work_start (overnight windows are not supported)")
         return self
+
+
+class ScheduleSettings(Settings):
+    """Settings for POST /schedule: identical, except the time zone is required (no UTC default)."""
+
+    timezone: str
 
 
 class SettingsPatch(Shape):
@@ -121,6 +129,8 @@ class Block(Shape):
             raise ValueError("end must be after start")
         if (self.end - self.start).days > 366:
             raise ValueError("a block cannot be longer than 366 days")
+        if not (BLOCK_MIN_YEAR <= self.start.year and self.end.year <= BLOCK_MAX_YEAR):
+            raise ValueError(f"block times must fall between the years {BLOCK_MIN_YEAR} and {BLOCK_MAX_YEAR}")
         return self
 
 
@@ -189,9 +199,18 @@ class SyncRequest(Shape):
     dismissed_events: Changes[Dismissal] = Field(default_factory=Changes)
 
 
+class SkippedItem(Shape):
+    """An item /sync deliberately did not save (the rest of the request was saved)."""
+
+    collection: Literal["calendars", "dismissed_events"]
+    id: str
+    reason: Literal["unknown_calendar", "duplicate_dismissal"]
+
+
 class SyncResponse(Shape):
     ok: bool = True
     server_time: UtcDatetime
+    skipped: list[SkippedItem] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- /schedule
@@ -199,7 +218,7 @@ class SyncResponse(Shape):
 class ScheduleRequest(Shape):
     tasks: list[Task] = Field(default_factory=list, max_length=MAX_TASKS)
     blocks: list[Block] = Field(default_factory=list, max_length=MAX_BLOCKS)
-    settings: Settings = Field(default_factory=Settings)
+    settings: ScheduleSettings  # required: `settings.timezone` has no default
     calendars: list[CalendarPatch] | None = Field(default=None, max_length=MAX_CALENDARS)
     locked_chunks: list[Chunk] = Field(default_factory=list, max_length=MAX_LOCKED_CHUNKS)
     now: UtcDatetime | None = None

@@ -11,11 +11,9 @@ from contextlib import asynccontextmanager
 import psycopg
 import psycopg_pool
 from fastapi import FastAPI, Request
-from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from . import crypto, db
@@ -44,7 +42,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ------------------------------------------------------------------------------ middleware
@@ -136,8 +133,24 @@ def _offending_ids(body, errors) -> list[str]:
 
 @app.exception_handler(RequestValidationError)
 async def on_validation_error(request: Request, exc: RequestValidationError):
-    content = {"detail": jsonable_encoder(exc.errors()), "ids": _offending_ids(exc.body, exc.errors())}
+    """One error shape everywhere: detail (string), plus ids and errors when they apply.
+
+    The submitted values are deliberately not echoed back.
+    """
+    errors = [{"loc": list(e.get("loc", ())), "msg": e.get("msg", ""), "type": e.get("type", "")} for e in exc.errors()]
+    content = {"detail": "Validation failed", "ids": _offending_ids(exc.body, exc.errors()), "errors": errors[:100]}
     return JSONResponse(status_code=422, content=content)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def on_rate_limited(request: Request, exc: RateLimitExceeded):
+    try:
+        retry_after = int(exc.limit.limit.get_expiry())  # length of the limit's window, in seconds
+    except (AttributeError, TypeError, ValueError):
+        retry_after = 60
+    return JSONResponse(
+        status_code=429, content={"detail": "Rate limit exceeded"}, headers={"Retry-After": str(retry_after)}
+    )
 
 
 @app.exception_handler(SyncConflict)
@@ -160,6 +173,12 @@ async def on_db_unavailable(request: Request, exc: Exception):
 @app.exception_handler(crypto.CryptoNotConfigured)
 async def on_crypto_not_configured(request: Request, exc: crypto.CryptoNotConfigured):
     return JSONResponse(status_code=503, content={"detail": "Server encryption is not configured"})
+
+
+@app.get("/", tags=["meta"], summary="Health check")
+def health() -> dict:
+    """Liveness probe. Does not touch the database or Google, so it answers instantly."""
+    return {"status": "ok"}
 
 
 app.include_router(auth_routes.router)

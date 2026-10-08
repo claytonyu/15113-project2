@@ -151,8 +151,14 @@ def _batch(conn: psycopg.Connection, sql: str, rows: list[tuple], ids: list[Any]
         raise SyncConflict(bad or [str(i) for i in ids], f"Could not save {what}.")
 
 
-def apply_sync(conn: psycopg.Connection, uid: Any, req: SyncRequest) -> None:
-    """Apply a batch of changes in one transaction. Idempotent: upserts by ID, deletes ignore misses."""
+def apply_sync(conn: psycopg.Connection, uid: Any, req: SyncRequest) -> list[dict]:
+    """Apply a batch of changes in one transaction. Idempotent: upserts by ID, deletes ignore misses.
+
+    Every upsert overwrites the stored row with the same ID. Items that are harmless to drop (a
+    calendar that no longer exists, a dismissal that duplicates an existing one) are skipped
+    rather than failing the whole batch; they are returned as [{collection, id, reason}].
+    """
+    skipped: list[dict] = []
     with conn.transaction():
         # --- settings
         if req.settings is not None and req.settings.model_fields_set:
@@ -173,7 +179,6 @@ def apply_sync(conn: psycopg.Connection, uid: Any, req: SyncRequest) -> None:
             )
 
         # --- calendar selection / padding overrides (calendars are created by Google sync only)
-        unknown: list[str] = []
         for patch_item in req.calendars:
             sets, params = [], []
             if patch_item.selected is not None:
@@ -189,9 +194,7 @@ def apply_sync(conn: psycopg.Connection, uid: Any, req: SyncRequest) -> None:
                 (*params, uid, patch_item.id),
             )
             if cur.rowcount == 0:
-                unknown.append(patch_item.id)
-        if unknown:
-            raise SyncConflict(unknown, "Unknown calendar ids.")
+                skipped.append({"collection": "calendars", "id": patch_item.id, "reason": "unknown_calendar"})
 
         # --- deletes (children first; deleting a task also removes its chunks)
         for table, changes in (
@@ -240,6 +243,8 @@ def apply_sync(conn: psycopg.Connection, uid: Any, req: SyncRequest) -> None:
             [c.id for c in req.chunks.upsert],
             "chunks (does each task_id exist?)",
         )
+        dismissals, dismissal_skips = _plan_dismissals(conn, uid, req.dismissed_events.upsert)
+        skipped.extend(dismissal_skips)
         _batch(
             conn,
             """
@@ -248,10 +253,51 @@ def apply_sync(conn: psycopg.Connection, uid: Any, req: SyncRequest) -> None:
             ON CONFLICT (user_id, id) DO UPDATE SET calendar_id = EXCLUDED.calendar_id,
                 google_event_id = EXCLUDED.google_event_id, scope = EXCLUDED.scope
             """,
-            [(uid, d.id, d.calendar_id, d.google_event_id, d.scope) for d in req.dismissed_events.upsert],
-            [d.id for d in req.dismissed_events.upsert],
-            "dismissed events (does each calendar_id exist?)",
+            [(uid, d.id, d.calendar_id, d.google_event_id, d.scope) for d in dismissals],
+            [d.id for d in dismissals],
+            "dismissed events",
         )
+    return skipped
+
+
+def _plan_dismissals(conn: psycopg.Connection, uid: Any, wanted: list) -> tuple[list, list[dict]]:
+    """Split dismissal upserts into (ones to save, ones to skip).
+
+    Skipped: the calendar no longer exists, or the same event+scope is already dismissed under a
+    different ID (database uniqueness rule), whether stored or earlier in this same request.
+    """
+    if not wanted:
+        return [], []
+    known = {
+        row["google_calendar_id"]
+        for row in conn.execute(
+            "SELECT google_calendar_id FROM calendars WHERE user_id = %s AND google_calendar_id = ANY(%s)",
+            (uid, list({d.calendar_id for d in wanted})),
+        ).fetchall()
+    }
+    # (calendar, event, scope) -> id that owns it. Deletes in this request have already run.
+    owner = {
+        (r["calendar_id"], r["google_event_id"], r["scope"]): r["id"]
+        for r in conn.execute(
+            "SELECT id, calendar_id, google_event_id, scope FROM dismissed_events WHERE user_id = %s", (uid,)
+        ).fetchall()
+    }
+    keep, skips = [], []
+    for d in wanted:
+        if d.calendar_id not in known:
+            skips.append({"collection": "dismissed_events", "id": str(d.id), "reason": "unknown_calendar"})
+            continue
+        key = (d.calendar_id, d.google_event_id, d.scope)
+        if owner.get(key, d.id) != d.id:
+            skips.append({"collection": "dismissed_events", "id": str(d.id), "reason": "duplicate_dismissal"})
+            continue
+        # An existing row with this ID that moves to a new key frees its old key.
+        for old_key, old_id in list(owner.items()):
+            if old_id == d.id:
+                del owner[old_key]
+        owner[key] = d.id
+        keep.append(d)
+    return keep, skips
 
 
 def delete_user(conn: psycopg.Connection, uid: Any) -> None:

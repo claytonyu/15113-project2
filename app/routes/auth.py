@@ -55,6 +55,8 @@ def google_callback(
     state: str | None = None,
     error: str | None = None,
 ):
+    if not get_config().google_configured:
+        return _frontend_redirect("login_error=not_configured")
     if error:
         return _frontend_redirect(f"login_error={quote(error[:50], safe='')}")
     try:

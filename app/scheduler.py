@@ -10,7 +10,8 @@ Rules implemented here (see SPEC.md, "Schedule generation"):
 - Every chunk STARTS on a 15-minute boundary (epoch-aligned). Blocks and padding are not
   snapped, so a chunk never overlaps an event by even a minute. Chunk LENGTHS are exact minutes.
 - Nothing is scheduled before `now` rounded up to the next 15 minutes.
-- `front_load`: earliest slots first. `even`: spread a task over the days available.
+- `front_load`: earliest slots first. `even`: spread a task over the days available, with a per-day
+  target rounded up to a multiple of the task's minimum chunk size.
 - A splittable task that only partly fits gets the part that fits; the rest is reported.
   A non-splittable task is placed whole or not at all.
 - Locked chunks are fixed, occupy time, and count toward their task's duration.
@@ -219,9 +220,10 @@ def _fill_even(local: FreeTime, remaining: int, min_chunk: int, tz: tzinfo, tick
     for idx, day in enumerate(days):
         if remaining <= 0:
             break
+        # Per-day target: an even share of what is left, rounded up to a multiple of the minimum chunk.
         target = _ceil_div(remaining, len(days) - idx)
-        target = _ceil_div(target, GRID_MIN) * GRID_MIN
-        day_left = min(max(target, min_chunk), remaining)
+        target = _ceil_div(target, min_chunk) * min_chunk
+        day_left = min(target, remaining)
         for s, e in by_day[day]:
             if day_left <= 0 or remaining <= 0:
                 break
@@ -276,10 +278,17 @@ def schedule(
     now: datetime,
     *,
     time_limit_s: float | None = None,
+    deadline_at: float | None = None,
     new_id: Callable[[], str] = lambda: str(uuid.uuid4()),
 ) -> Result:
-    """Generate unlocked chunks for every task. `busy` must already include padding."""
-    deadline = _time.monotonic() + time_limit_s if time_limit_s else None
+    """Generate unlocked chunks for every task. `busy` must already include padding.
+
+    The compute limit is either `time_limit_s` (seconds from now) or `deadline_at` (a
+    `time.monotonic()` value, so callers can share one clock with earlier work).
+    """
+    deadline = deadline_at
+    if deadline is None and time_limit_s:
+        deadline = _time.monotonic() + time_limit_s
 
     def tick() -> None:
         if deadline is not None and _time.monotonic() > deadline:
@@ -373,10 +382,13 @@ def schedule(
     for task in pending:
         need = needs[task.id]
         if task.due_at <= lo:
-            result.warnings.append(
-                Warn("deadline_passed", f"'{task.title}' is already past due, so nothing could be scheduled.",
-                     task_id=task.id)
-            )
+            # Only a deadline that is really over (checked against the real `now`, not the rounded-up
+            # start) gets a warning. A task due in a few minutes simply has no 15-minute slot left.
+            if task.due_at <= now:
+                result.warnings.append(
+                    Warn("deadline_passed", f"'{task.title}' is already past due, so nothing could be scheduled.",
+                         task_id=task.id)
+                )
             result.unschedulable.append(Missing(task.id, need))
             continue
 
