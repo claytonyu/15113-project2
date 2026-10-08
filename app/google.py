@@ -34,6 +34,7 @@ REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 CALENDAR_API = "https://www.googleapis.com/calendar/v3"
 SCOPES = "openid email https://www.googleapis.com/auth/calendar.readonly"
+ACCESS_TOKEN_REJECTED = "access_token_rejected"  # internal; services.py retries, then reports reauth_required
 STATE_COOKIE = "tp_oauth_state"
 STATE_TTL_S = 600
 
@@ -174,7 +175,8 @@ def _get(url: str, access_token: str, params: dict | None = None) -> dict:
     except httpx.HTTPError as exc:
         raise GoogleError("google_unavailable", str(exc)) from exc
     if resp.status_code == 401:
-        raise GoogleError("reauth_required", "access token rejected")
+        # Not the same as a rejected refresh token: the caller can fetch a fresh access token and retry.
+        raise GoogleError(ACCESS_TOKEN_REJECTED, "access token rejected")
     if resp.status_code != 200:
         raise GoogleError("google_unavailable", f"Google returned {resp.status_code}")
     return resp.json()
@@ -283,7 +285,7 @@ def fetch_events(
             try:
                 events.extend(future.result())
             except GoogleError as exc:
-                if error is None or exc.code == "reauth_required":
+                if error is None or exc.code in ("reauth_required", ACCESS_TOKEN_REJECTED):
                     error = exc.code
     return events, error
 

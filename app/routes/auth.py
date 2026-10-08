@@ -68,7 +68,8 @@ def google_callback(
         info = google.get_userinfo(access)
         calendars = google.list_calendars(access)
     except google.GoogleError as exc:
-        return _frontend_redirect(f"login_error={quote(exc.code, safe='')}")
+        code = "reauth_required" if exc.code == google.ACCESS_TOKEN_REJECTED else exc.code
+        return _frontend_redirect(f"login_error={quote(code, safe='')}")
 
     # New users start in their primary calendar's timezone.
     tz_name = next((c["time_zone"] for c in calendars if c["primary"] and c["time_zone"]), "UTC")

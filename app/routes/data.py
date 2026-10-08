@@ -26,12 +26,12 @@ def get_state(sync_google: bool = True, user: dict = Depends(auth.require_user))
     if sync_google:
         access, google_error = services.google_access(uid)
         if access:
-            try:
-                calendars = google.list_calendars(access)
+            listed, list_error = services.list_user_calendars(uid, access)
+            if list_error:
+                access, google_error = None, list_error
+            else:
                 with connect() as conn:
-                    repo.sync_calendar_list(conn, uid, calendars)
-            except google.GoogleError as exc:
-                access, google_error = None, exc.code
+                    repo.sync_calendar_list(conn, uid, listed)
 
     with connect() as conn:
         tasks = repo.fetch_tasks(conn, uid)

@@ -58,6 +58,21 @@ python -m pytest
 Covers the scheduling engine (`scheduler.py`, `busy.py`): placement rules, padding, recurrence
 rules and their validation, DST handling, spread modes, locked chunks, time zones.
 
+#### Google integration tests (opt-in)
+
+```bash
+RUN_INTEGRATION_TESTS=1 python -m pytest tests/integration
+```
+
+These act as the frontend: they run the real backend against the real database in `DATABASE_URL`,
+with Google replaced by a fake (`tests/integration/fake_google.py`). They cover login, calendars and
+events, dismissals, generating with Google events, Google failures (`reauth_required`,
+`google_unavailable`), logout, account deletion, and isolation between users. Each test creates its own
+user (`google_id` starting with `itest-`) and deletes it afterwards. **Use a development database**; the
+tests refuse to run with `ENVIRONMENT=production`. The suite takes a few minutes against Neon. Without the
+variable, these tests are skipped. They cannot prove that real Google sends the same JSON; only a live
+login can (see "Set up Google login").
+
 ## Set up Google login
 
 1. In Google Cloud Console, create a project, enable the **Google Calendar API**.
