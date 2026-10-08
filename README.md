@@ -14,7 +14,8 @@ As a student that is developing time management as a skill, I wanted to create t
 
 I like the "Results" section on the bottom right, which handles conflicts gracefully and allows users to adjust. It makes the workflow responsive and more fluid than crashing entirely.
 
-## Run locally
+# Instructions for Running Locally (AI-Assisted)
+## Shell Commands
 
 ```bash
 source .venv/bin/activate
