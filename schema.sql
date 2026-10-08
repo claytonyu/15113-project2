@@ -7,13 +7,16 @@ CREATE TABLE IF NOT EXISTS users (
     google_id    text NOT NULL UNIQUE,
     email        text NOT NULL,
     timezone     text NOT NULL DEFAULT 'UTC',
-    padding_min  integer NOT NULL DEFAULT 15 CHECK (padding_min BETWEEN 0 AND 240),
+    padding_min  integer NOT NULL DEFAULT 0 CHECK (padding_min BETWEEN 0 AND 240),
     work_start   time NOT NULL DEFAULT '08:00',
     work_end     time NOT NULL DEFAULT '22:00',
     spread_mode  text NOT NULL DEFAULT 'even' CHECK (spread_mode IN ('even', 'front_load')),
     created_at   timestamptz NOT NULL DEFAULT now(),
     CHECK (work_end > work_start)
 );
+-- CREATE TABLE IF NOT EXISTS leaves an existing table alone, so re-assert the default here.
+-- Only affects newly created users; stored values are not changed.
+ALTER TABLE users ALTER COLUMN padding_min SET DEFAULT 0;
 
 -- Only a SHA-256 hash of the bearer token is stored.
 CREATE TABLE IF NOT EXISTS sessions (

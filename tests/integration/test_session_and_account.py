@@ -100,7 +100,7 @@ def test_logging_in_after_deleting_the_account_starts_from_scratch(google, signe
     body = again.state().json()
     assert database.user_id(fe.sub) != old_id
     assert body["tasks"] == body["blocks"] == body["chunks"] == body["dismissed_events"] == []
-    assert body["settings"]["padding_min"] == 15  # defaults again
+    assert body["settings"]["padding_min"] == 0  # defaults again
     assert {c["selected"] for c in body["calendars"]} == {False}
 
 

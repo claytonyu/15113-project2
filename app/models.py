@@ -54,7 +54,7 @@ class Shape(BaseModel):
 # ----------------------------------------------------------------------------- settings
 
 class Settings(Shape):
-    padding_min: Padding = 15
+    padding_min: Padding = 0
     work_start: HHMM = "08:00"
     work_end: HHMM = "22:00"
     spread_mode: Literal["even", "front_load"] = "even"
