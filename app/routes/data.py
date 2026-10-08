@@ -1,10 +1,10 @@
 """Endpoints 4, 5, 7: load state, batch-save changes, delete account."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 
 from .. import auth, crypto, google, repo, services
 from ..db import connect
@@ -12,11 +12,30 @@ from ..models import StateResponse, SyncRequest, SyncResponse
 
 router = APIRouter(tags=["data"])
 
-GOOGLE_LOAD_WINDOW = timedelta(days=60)
+GOOGLE_WINDOW_HALF_DAYS = 30  # events are loaded for center - 30 days to center + 30 days
+MAX_OFFSET_DAYS = 3650
+
+
+def google_window(now: datetime, tz: ZoneInfo, offset_days: int) -> tuple[datetime, datetime]:
+    """[start, end) of the Google event window: 30 local days either side of today + offset_days.
+
+    Both edges are local midnight in the user's time zone (calendar-day arithmetic, so daylight
+    saving changes do not move them off midnight).
+    """
+    center = now.astimezone(tz).date() + timedelta(days=offset_days)
+    half = timedelta(days=GOOGLE_WINDOW_HALF_DAYS)
+    return (
+        datetime.combine(center - half, time.min, tzinfo=tz),
+        datetime.combine(center + half, time.min, tzinfo=tz),
+    )
 
 
 @router.get("/state", response_model=StateResponse, summary="Everything the app needs on load")
-def get_state(sync_google: bool = True, user: dict = Depends(auth.require_user)):
+def get_state(
+    sync_google: bool = True,
+    offset_days: int = Query(0, ge=-MAX_OFFSET_DAYS, le=MAX_OFFSET_DAYS),
+    user: dict = Depends(auth.require_user),
+):
     uid = user["id"]
     now = datetime.now(timezone.utc)
     tz = ZoneInfo(user["timezone"])
@@ -43,9 +62,8 @@ def get_state(sync_google: bool = True, user: dict = Depends(auth.require_user))
     google_events: list[dict] = []
     if access:
         selected = [c["id"] for c in calendars if c["selected"]]
-        google_events, fetch_error = services.fetch_user_events(
-            uid, access, selected, now, now + GOOGLE_LOAD_WINDOW, tz
-        )
+        window_start, window_end = google_window(now, tz, offset_days)
+        google_events, fetch_error = services.fetch_user_events(uid, access, selected, window_start, window_end, tz)
         google_error = google_error or fetch_error
 
     return {

@@ -119,8 +119,11 @@ class Frontend:
 
     # ------------------------------------------------------------------------- endpoints
 
-    def state(self, sync_google: bool = True):
-        return self.api("GET", "/state", params={"sync_google": str(sync_google).lower()})
+    def state(self, sync_google: bool = True, offset_days: int | None = None):
+        params = {"sync_google": str(sync_google).lower()}
+        if offset_days is not None:
+            params["offset_days"] = offset_days
+        return self.api("GET", "/state", params=params)
 
     def sync(self, body: dict):
         return self.api("PATCH", "/sync", json=body)

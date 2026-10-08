@@ -68,13 +68,45 @@ def test_recurring_instances_arrive_expanded_with_their_series_id(busy_week):
     assert events["cs_mon"]["id"] != events["cs_tue"]["id"]
 
 
-def test_events_are_requested_for_the_next_60_days_with_single_events(google, busy_week):
-    busy_week.state()
+def requested_window(google) -> tuple[datetime, datetime]:
     request = google.calls(path_part="/events")[-1]
     assert request.params["singleEvents"] == "true"
-    window = parse(request.params["timeMax"]) - parse(request.params["timeMin"])
-    assert window == timedelta(days=60)
-    assert abs(parse(request.params["timeMin"]) - datetime.now(UTC)) < timedelta(minutes=2)
+    return parse(request.params["timeMin"]), parse(request.params["timeMax"])
+
+
+def test_events_are_requested_for_30_days_either_side_of_today_with_single_events(google, busy_week):
+    busy_week.state()
+    t_min, t_max = requested_window(google)
+    assert t_min == local_dt(-30, 0).astimezone(UTC)  # local midnight, 30 days ago
+    assert t_max == local_dt(30, 0).astimezone(UTC)   # local midnight, 30 days ahead
+
+
+def test_offset_days_moves_the_window_and_defaults_to_zero(google, busy_week):
+    busy_week.state(offset_days=-30)
+    assert requested_window(google) == (local_dt(-60, 0).astimezone(UTC), local_dt(0, 0).astimezone(UTC))
+
+    busy_week.state(offset_days=45)
+    assert requested_window(google) == (local_dt(15, 0).astimezone(UTC), local_dt(75, 0).astimezone(UTC))
+
+    busy_week.state(offset_days=0)
+    assert requested_window(google) == (local_dt(-30, 0).astimezone(UTC), local_dt(30, 0).astimezone(UTC))
+
+
+def test_offset_days_selects_which_events_come_back(google, signed_in):
+    fe = signed_in()
+    for name, day in (("past", -20), ("old", -45), ("soon", 5), ("later", 50)):
+        google.add_event(fe.sub, "primary@test", timed_event(name, name, local_dt(day, 10), local_dt(day, 11)))
+    fe.sync({"calendars": [{"id": "primary@test", "selected": True}]})
+
+    assert set(events_by_id(fe.state().json())) == {"past", "soon"}  # past events are included now
+    assert set(events_by_id(fe.state(offset_days=-30).json())) == {"past", "old"}
+    assert set(events_by_id(fe.state(offset_days=45).json())) == {"later"}
+
+
+def test_offset_days_out_of_range_is_rejected(busy_week):
+    assert busy_week.state(offset_days=3651).status_code == 422
+    assert busy_week.state(offset_days=-3651).status_code == 422
+    assert busy_week.state(offset_days=3650).status_code == 200
 
 
 def test_only_selected_calendars_are_fetched(google, busy_week):
